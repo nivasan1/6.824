@@ -10,9 +10,10 @@ import (
 
 // enum reporesenting the status associated with each job
 const (
-	NOT_STARTED = iota // indication that the job has yet to start
-	MAP_DONE    = iota
-	REDUCE_DONE = iota
+	NOT_STARTED = iota + 1 // indication that the job has yet to start
+	MAP_DONE
+	REDUCE_DONE
+	ERROR
 )
 
 type Coordinator struct {
@@ -63,16 +64,16 @@ func (c *Coordinator) Done() bool {
 */
 func (c *Coordinator) RequestJob(req *Request, res *Response) *Response {
 	// update status of current job of worker
-	c.procs[req.curJobFname] = req.curJobStatus
+	c.procs[req.CurJobFname] = req.CurJobStatus
 	for job, status := range c.procs {
 		if status != REDUCE_DONE {
 			// increment status of job for jobs that have not been yet finished
 			status++
 			// return the response to indicate to worker what the work to be finished is
 			return &Response{
-				fname:     job,
-				jobStatus: status,
-				taskNum:   c.tasks,
+				Fname:     job,
+				JobStatus: status,
+				TaskNum:   c.tasks,
 			}
 		}
 	}

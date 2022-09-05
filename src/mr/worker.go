@@ -13,7 +13,6 @@ import (
 
 	"sync"
 
-	"github.com/Workiva/go-datastructures/threadsafe/err"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -57,7 +56,7 @@ type EncoderWrap struct {
 	// underlying encoder
 	enc *json.Encoder
 	// underlying file obj
-	file *os.File
+	File *os.File
 }
 
 // convenience method for locking handle to file
@@ -71,7 +70,7 @@ func (fw *EncoderWrap) UnLock() {
 }
 
 // convenience method for instantiating multiple EncoderWraps
-func NewEncoderWrap(taskName string, taskNum uint) (*EncoderWrap, error) {
+func NewEncoderWrap(taskName string, taskNum int) (*EncoderWrap, error) {
 	file, err := CreateFile(taskName, taskNum)
 	if err != nil {
 		return nil, err
@@ -79,13 +78,13 @@ func NewEncoderWrap(taskName string, taskNum uint) (*EncoderWrap, error) {
 	return &EncoderWrap{
 		mut:  sync.Mutex{},
 		enc:  json.NewEncoder(file),
-		file: file,
+		File: file,
 	}, nil
 }
 
 //closes the EncoderWrap
 func (ec *EncoderWrap) Close() error {
-	err := ec.file.Close()
+	err := ec.File.Close()
 	return err
 }
 
@@ -100,8 +99,40 @@ func ihash(key string) int {
 }
 
 // convenience method around KeyValue to determine bucket placement
-func (kv KeyValue) WhichBucket(numReduce uint) uint {
-	return uint(ihash(kv.Key)) % numReduce
+func (kv KeyValue) WhichBucket(numReduce int) int {
+	return ihash(kv.Key) % numReduce
+}
+
+/*
+	Function takes in a slice of KVs, an array of EncWrappers,
+	Handles encoding of all KVs into requisite files,
+*/
+func WriteBuckets(kvs []KeyValue, files []*EncoderWrap) error {
+	var err error
+	for i := 0; i < len(kvs); i++ {
+		// list is sorted, so batch all requests with same key into same write
+		// writes are done synchronously, so grab the handle
+		hashKey := kvs[i].WhichBucket(len(files))
+		files[hashKey].Lock()
+		// group tasks of writing KVs with same key to the same encoded file
+		for {
+			if err = files[hashKey].enc.Encode(&kvs[i]); err != nil {
+				files[hashKey].UnLock()
+				return err
+			}
+			// only increment if we are not at the end of the list
+			if i >= len(kvs)-1 {
+				files[hashKey].UnLock()
+				return nil
+			}
+			if !(strings.Compare(kvs[i].Key, kvs[i+1].Key) == 0) {
+				break
+			}
+			i++
+		}
+		files[hashKey].UnLock()
+	}
+	return nil
 }
 
 //
@@ -116,113 +147,120 @@ func Worker(mapf func(string, string) []KeyValue,
 	if err != nil {
 		log.Fatalf("mr::Worker: error requesting job")
 	}
-	
+
 	// now in an endless loop receive calls from the co-ordinator and process them
 	for {
 		// handle request from the Co-ordinator
-		switch res.jobStatus {
+		switch res.JobStatus {
 		case NOT_STARTED:
 			// handle map, return the updated Request to the Co-Ordinator
-			_, err = res.HandleMap(mapf)			
-			if err != nil { 
+			req, err = res.HandleMap(mapf)
+			if err != nil {
 				log.Fatalf("worker.go::Worker: %v", err)
 			}
 		case MAP_DONE:
-
+			
 		}
+		// request new task
 	}
 
 }
 
-// Handle map method for processing map requests, takes as argument a request sent from the co-ordinator, handles the request, 
+// Handle map method for processing map requests, takes as argument a request sent from the co-ordinator, handles the request,
 //returns any error emitted during processing of request, and returns the response to the co-ordinator
 // Request Returned should be sent to the co-ordinator for subsequent processing
-func (res *Response) HandleMap(mapf func (string, string)[]KeyValue) (*Request, error) { 
+func (res *Response) HandleMap(mapf func(string, string) []KeyValue) (*Request, error) {
 	// fail if no filename has been provided
-	if res.fname == "" {
-		return  &Request{}, errors.New(fmt.Sprint("worker.go::Worker: no filename returned", res.fname))
+	if res.Fname == "" {
+		return &Request{
+			CurJobFname:  res.Fname,
+			CurJobStatus: ERROR,
+		}, errors.New(fmt.Sprint("worker.go::Worker: no filename returned", res.Fname))
 	}
 
 	// fname exists, let's open it
-	contents, err := ReadContents(res.fname)
+	contents, err := ReadContents(res.Fname)
 	if err != nil {
-		return &Request{}, errors.New(fmt.Sprintf("worker.go::Worker: error opening/reading contents of file: %v", err.Error()))
+		return &Request{
+			CurJobFname:  res.Fname,
+			CurJobStatus: ERROR,
+		}, errors.New(fmt.Sprintf("worker.go::Worker: error opening/reading contents of file: %v", err.Error()))
 	}
 	// instantiate wait group object for grouping go-routines
-	var eg *errgroup.Group
+	eg := &errgroup.Group{}
 
 	// create encoder wraps in paralell
-	encWraps := make([]*EncoderWrap, res.taskNum)
-	for i := 0; i < res.taskNum; i++ {
-		//use err group so we can wait on all tasks to finish and then
-		eg.Go(func() error {
-			encWraps[i], err = NewEncoderWrap(res.fname, uint(i))
-			return err
-		})
+	encWraps := make([]*EncoderWrap, res.TaskNum)
+	for i := 0; i < res.TaskNum; i++ {
+		encWraps[i], err = NewEncoderWrap(res.Fname, i)
+		if err != nil {
+			return &Request{
+				CurJobFname:  res.Fname,
+				CurJobStatus: ERROR,
+			}, err
+		}
 	}
+	// this must be finished in the event of any unexpected events
+	defer func() {
+		// now close all files
+		for i := 0; i < len(encWraps); i++ {
+			encWraps[i].Close()
+		}
+	}()
 	// kvs un-bucketed
-	kvs := mapf(res.fname, contents)
-	bucketSize := len(kvs) / res.taskNum // kvs per bucket
+	kvs := mapf(res.Fname, contents)
+	bucketSize := len(kvs) / res.TaskNum // kvs per bucket
 	// block for all Enc Wrappers to be created fail if any file creators fail
 	err = eg.Wait()
 	if err != nil {
-		return &Request{},  errors.New("worker.go::fatal error creating files")
+		return &Request{
+			CurJobFname:  res.Fname,
+			CurJobStatus: ERROR,
+		}, errors.New("worker.go::fatal error creating files")
 	}
 
 	// first sort unstructured data, that way, we can avoid doing this operation many times
 	sort.Sort(&KvWrap{kvs})
 
-	ecList := encWrapsList{
-		kvs:     kvs,
-		list:    encWraps,
-		taskNum: uint(res.taskNum),
-	}
+	var wg sync.WaitGroup
 	// create sync waitgroup to group tasks into seperate go-routines
 	// allocate tasks per go-routine via bucket size
+	wg.Add(len(encWraps))
+	errChan := make(chan error)
+	// ensure that errChan is closed
+	defer close(errChan)
+	// iteration variable is re-used, ensure that the value is passed to go-routine,
+	// not the reference
 	for i := 0; i < len(encWraps); i++ {
-		eg.Go(
-			func() error {
-				err = ecList.WriteBuckets(i*bucketSize, (i+1)*bucketSize)
-				return err
-			})
-	}
-	eg.Wait()
-	// now close all files
-	for i := 0; i < len(encWraps); i++ {
-		eg.Go(func() error {
-			return encWraps[i].Close()
-		})
-	}
-	if err = eg.Wait(); err != nil {
-		return &Request{}, errors.New(fmt.Sprint("worker.go::error closing encoder wraps: %v", err.Error()))
-	}
-	return &Request{}, nil
-}
-
-
-type encWrapsList struct {
-	kvs     []KeyValue
-	list    []*EncoderWrap
-	taskNum uint
-}
-
-func (ec encWrapsList) WriteBuckets(idxStart, idxEnd int) error {
-	var err error
-	for i := idxStart; i < idxEnd; i++ {
-		// list is sorted, so batch all requests with same key into same write
-		// writes are done synchronously, so grab the handle
-		hashKey := ec.kvs[i].WhichBucket(ec.taskNum)
-		ec.list[hashKey].Lock()
-		// group tasks of writing KVs with same key to the same encoded file
-		for ; strings.Compare(ec.kvs[i].Key, ec.kvs[i+1].Key) == 0; i++ {
-			if err = ec.list[hashKey].enc.Encode(&ec.kvs[i]); err != nil {
-				return err
+		go func(i int) {
+			// handle reading from the keys concurrently
+			err := WriteBuckets(kvs[bucketSize*i:bucketSize*(i+1)], encWraps)
+			if err != nil {
+				// send error through channel
+				errChan <- err
+				wg.Done()
 			}
-		}
-		// when we are done writing to file release handle
-		ec.list[hashKey].UnLock()
+			errChan <- nil
+			wg.Done()
+		}(i)
 	}
-	return nil
+	// order receipt from corresponding go-routines, and check if any errors exist
+	for i := 0; i < len(encWraps); i++ {
+		if <-errChan != nil {
+			return &Request{
+				CurJobFname:  res.Fname,
+				CurJobStatus: ERROR,
+			}, errors.New(fmt.Sprintf("worker.go::error closing encoder wraps: %v", err.Error()))
+		}
+	}
+	// block until all processes have finished
+	wg.Wait()
+
+	// return results to the co-ordinator indicating that the map task has been completed
+	return &Request{
+		CurJobFname:  res.Fname,
+		CurJobStatus: MAP_DONE,
+	}, nil
 }
 
 //
@@ -251,7 +289,7 @@ func call(rpcname string, args interface{}, reply interface{}) error {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatalf("dialing:", err)
+		log.Fatalf("dialing: %s", err.Error())
 	}
 	defer c.Close()
 
@@ -266,7 +304,7 @@ func call(rpcname string, args interface{}, reply interface{}) error {
 // create file for writing, meant to be opened in synced goroutine
 // bubbles any errors encountered in the process of file creation
 //file closure is delegated to caller
-func CreateFile(taskName string, taskNum uint) (*os.File, error) {
+func CreateFile(taskName string, taskNum int) (*os.File, error) {
 	// format the temp file name according to task and task number
 	s := fmt.Sprintf("temp-%s-%d", taskName, taskNum)
 	//open the file to write to

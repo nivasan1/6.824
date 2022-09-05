@@ -1,4 +1,4 @@
-package main
+package mrapps
 
 //
 // a word-count application "plugin" for MapReduce.
